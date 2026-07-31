@@ -784,46 +784,6 @@ func (c *Connector) findAndConnectBackend(frontendConn net.Conn,
 		return
 	}
 
-	if c.connectionNotifier != nil {
-		err := c.connectionNotifier.NotifyConnected(c.ctx, clientAddr, serverAddress, playerInfo, backendHostPort)
-		if err != nil {
-			logrus.WithError(err).Warn("failed to notify connected")
-		}
-	}
-
-	c.metrics.ConnectionsBackend.With("host", sanitizeUTF8(resolvedHost)).Add(1)
-
-	c.metrics.ActiveConnections.Set(float64(
-		atomic.AddInt32(&c.totalActiveConnections, 1)))
-
-	c.activeConnections.Increment(backendHostPort)
-	c.scaleActiveConnections.Increment(scalingTarget)
-	c.metrics.ServerActiveConnections.
-		With("server_address", sanitizeUTF8(serverAddress)).
-		Set(float64(c.activeConnections.GetCount(backendHostPort)))
-
-	if c.recordLogins && playerInfo != nil {
-		logrus.
-			WithField("client", clientAddr).
-			WithField("player", playerInfo).
-			WithField("serverAddress", serverAddress).
-			Info("Player attempted to login to server")
-
-		c.metrics.ServerActivePlayer.
-			With("player_name", sanitizeUTF8(playerInfo.Name)).
-			With("player_uuid", sanitizeUTF8(playerInfo.Uuid.String())).
-			With("server_address", sanitizeUTF8(serverAddress)).
-			Set(1)
-
-		c.metrics.ServerLogins.
-			With("player_name", sanitizeUTF8(playerInfo.Name)).
-			With("player_uuid", sanitizeUTF8(playerInfo.Uuid.String())).
-			With("server_address", sanitizeUTF8(serverAddress)).
-			Add(1)
-	}
-
-	cleanupMetrics = true
-
 	// PROXY protocol implementation
 	if c.sendProxyProto {
 
@@ -882,6 +842,46 @@ func (c *Connector) findAndConnectBackend(frontendConn net.Conn,
 		_ = backendConn.Close()
 		return
 	}
+
+	if c.connectionNotifier != nil {
+		err := c.connectionNotifier.NotifyConnected(c.ctx, clientAddr, serverAddress, playerInfo, backendHostPort)
+		if err != nil {
+			logrus.WithError(err).Warn("failed to notify connected")
+		}
+	}
+
+	c.metrics.ConnectionsBackend.With("host", sanitizeUTF8(resolvedHost)).Add(1)
+
+	c.metrics.ActiveConnections.Set(float64(
+		atomic.AddInt32(&c.totalActiveConnections, 1)))
+
+	c.activeConnections.Increment(backendHostPort)
+	c.scaleActiveConnections.Increment(scalingTarget)
+	c.metrics.ServerActiveConnections.
+		With("server_address", sanitizeUTF8(serverAddress)).
+		Set(float64(c.activeConnections.GetCount(backendHostPort)))
+
+	if c.recordLogins && playerInfo != nil {
+		logrus.
+			WithField("client", clientAddr).
+			WithField("player", playerInfo).
+			WithField("serverAddress", serverAddress).
+			Info("Player attempted to login to server")
+
+		c.metrics.ServerActivePlayer.
+			With("player_name", sanitizeUTF8(playerInfo.Name)).
+			With("player_uuid", sanitizeUTF8(playerInfo.Uuid.String())).
+			With("server_address", sanitizeUTF8(serverAddress)).
+			Set(1)
+
+		c.metrics.ServerLogins.
+			With("player_name", sanitizeUTF8(playerInfo.Name)).
+			With("player_uuid", sanitizeUTF8(playerInfo.Uuid.String())).
+			With("server_address", sanitizeUTF8(serverAddress)).
+			Add(1)
+	}
+
+	cleanupMetrics = true
 
 	c.pumpConnections(frontendConn, backendConn, playerInfo)
 }
