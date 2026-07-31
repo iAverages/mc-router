@@ -95,6 +95,7 @@ func NewConnector(ctx context.Context, routes IRoutes, downScaler IDownScaler, m
 		scaleActiveConnections:     NewActiveConnections(),
 		wakingServers:              NewActiveConnections(),
 		backendDialTimeout:         defaultBackendDialTimeout,
+		drainDeadline:              make(chan struct{}),
 	}
 }
 
@@ -124,6 +125,8 @@ type Connector struct {
 	receiveProxyProto          bool
 	recordLogins               bool
 	trustedProxyNets           []*net.IPNet
+	listenerMu                 sync.Mutex
+	listener                   net.Listener
 	totalActiveConnections     int32
 	activeConnections          *ActiveConnections
 	scaleActiveConnections     *ActiveConnections
@@ -136,10 +139,16 @@ type Connector struct {
 	asleepMOTD                 string
 	loadingMOTD                string
 	backendDialTimeout         time.Duration
+	drainOnShutdown            bool
+	drainDeadline              chan struct{}
 }
 
 func (c *Connector) UseConnectionNotifier(notifier ConnectionNotifier) {
 	c.connectionNotifier = notifier
+}
+
+func (c *Connector) UseDrainOnShutdown(drainOnShutdown bool) {
+	c.drainOnShutdown = drainOnShutdown
 }
 
 func (c *Connector) UseClientFilter(filter *ClientFilter) {
@@ -152,9 +161,27 @@ func (c *Connector) StartAcceptingConnections(listenAddress string, connRateLimi
 		return err
 	}
 
+	c.listenerMu.Lock()
+	c.listener = ln
+	c.listenerMu.Unlock()
+
 	go c.acceptConnections(ln, connRateLimit, metricsPeriod)
 
 	return nil
+}
+
+func (c *Connector) StopAcceptingConnections() {
+	c.listenerMu.Lock()
+	defer c.listenerMu.Unlock()
+
+	if c.listener == nil {
+		return
+	}
+
+	if err := c.listener.Close(); err != nil && !errors.Is(err, net.ErrClosed) {
+		logrus.WithError(err).Warn("Failed to close listener")
+	}
+	c.listener = nil
 }
 
 func (c *Connector) createListener(listenAddress string) (net.Listener, error) {
@@ -220,6 +247,12 @@ func (c *Connector) WaitForConnections() {
 	defer c.connectionsCond.L.Unlock()
 
 	for {
+		select {
+		case <-c.drainDeadline:
+			return
+		default:
+		}
+
 		count := atomic.LoadInt32(&c.totalActiveConnections)
 		if count > 0 {
 			logrus.Infof("Waiting on %d connection(s)", count)
@@ -230,6 +263,28 @@ func (c *Connector) WaitForConnections() {
 	}
 }
 
+// DrainConnections waits for active connections until the shared shutdown
+// deadline expires. A zero timeout waits indefinitely.
+func (c *Connector) DrainConnections(timeout time.Duration) {
+	if timeout > 0 {
+		timer := time.AfterFunc(timeout, func() {
+			c.connectionsCond.L.Lock()
+			defer c.connectionsCond.L.Unlock()
+
+			select {
+			case <-c.drainDeadline:
+			default:
+				logrus.WithField("drainTimeout", timeout).Info("Shutdown drain timeout elapsed")
+				close(c.drainDeadline)
+			}
+			c.connectionsCond.Broadcast()
+		})
+		defer timer.Stop()
+	}
+
+	c.WaitForConnections()
+}
+
 // AcceptConnection provides a way to externally supply a connection to consume.
 // Note that this will skip rate limiting.
 func (c *Connector) AcceptConnection(conn net.Conn) {
@@ -237,8 +292,15 @@ func (c *Connector) AcceptConnection(conn net.Conn) {
 }
 
 func (c *Connector) acceptConnections(ln net.Listener, connRateLimit int, metricsPeriod time.Duration) {
-	//noinspection GoUnhandledErrorResult
-	defer ln.Close()
+	defer func() {
+		//noinspection GoUnhandledErrorResult
+		_ = ln.Close()
+		c.listenerMu.Lock()
+		if c.listener == ln {
+			c.listener = nil
+		}
+		c.listenerMu.Unlock()
+	}()
 
 	bucket := ratelimit.NewBucketWithRate(float64(connRateLimit), int64(connRateLimit*2))
 	if metricsPeriod > 0 {
@@ -253,6 +315,9 @@ func (c *Connector) acceptConnections(ln net.Listener, connRateLimit int, metric
 		case <-time.After(bucket.Take(1)):
 			conn, err := ln.Accept()
 			if err != nil {
+				if errors.Is(err, net.ErrClosed) || c.ctx.Err() != nil {
+					return
+				}
 				logrus.WithError(err).Error("Failed to accept connection")
 			} else {
 				go c.HandleConnection(conn)
@@ -542,8 +607,12 @@ func (c *Connector) cleanupBackendConnection(clientAddr net.Addr, serverAddress 
 	}
 
 	if cleanupMetrics {
-		c.metrics.ActiveConnections.Set(float64(
-			atomic.AddInt32(&c.totalActiveConnections, -1)))
+		c.connectionsCond.L.Lock()
+		totalActiveConnections := atomic.AddInt32(&c.totalActiveConnections, -1)
+		c.connectionsCond.Signal()
+		c.connectionsCond.L.Unlock()
+
+		c.metrics.ActiveConnections.Set(float64(totalActiveConnections))
 
 		c.activeConnections.Decrement(backendHostPort)
 		c.metrics.ServerActiveConnections.
@@ -569,7 +638,6 @@ func (c *Connector) cleanupBackendConnection(clientAddr net.Addr, serverAddress 
 	if checkScaleDown && c.scaleActiveConnections.GetCount(scalingTarget) <= 0 {
 		c.downScaler.Start(c.ctx, scalingTarget, c.routes)
 	}
-	c.connectionsCond.Signal()
 }
 
 func (c *Connector) findAndConnectBackend(frontendConn net.Conn,
@@ -830,17 +898,27 @@ func (c *Connector) pumpConnections(frontendConn, backendConn net.Conn, playerIn
 	go c.pumpFrames(backendConn, frontendConn, errorsChan, "backend", "frontend", clientAddr, playerInfo)
 	go c.pumpFrames(frontendConn, backendConn, errorsChan, "frontend", "backend", clientAddr, playerInfo)
 
-	select {
-	case err := <-errorsChan:
-		if err != io.EOF {
-			logrus.WithError(err).
-				WithField("client", clientAddr).
-				Error("Error observed on connection relay")
-			c.metrics.Errors.With("type", "relay").Add(1)
+	var err error
+	if c.drainOnShutdown {
+		select {
+		case err = <-errorsChan:
+		case <-c.drainDeadline:
+			return
 		}
+	} else {
+		select {
+		case err = <-errorsChan:
+		case <-c.ctx.Done():
+			logrus.Debug("Connector observed context cancellation")
+			return
+		}
+	}
 
-	case <-c.ctx.Done():
-		logrus.Debug("Connector observed context cancellation")
+	if err != io.EOF {
+		logrus.WithError(err).
+			WithField("client", clientAddr).
+			Error("Error observed on connection relay")
+		c.metrics.Errors.With("type", "relay").Add(1)
 	}
 }
 

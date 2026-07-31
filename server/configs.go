@@ -46,6 +46,8 @@ type Config struct {
 	ApiBinding             string            `usage:"The [host:port] bound for servicing API requests"`
 	CpuProfile             string            `usage:"Enables CPU profiling and writes to given path"`
 	ConnectionRateLimit    int               `default:"1" usage:"Max number of connections to allow per second"`
+	DrainOnShutdown        bool              `default:"false" usage:"On shutdown, stop accepting new connections and wait for existing connections to close"`
+	DrainTimeout           time.Duration     `default:"0s" usage:"Maximum time to wait for existing connections to close when drain-on-shutdown is enabled; 0 waits indefinitely"`
 	BackendDialTimeout     time.Duration     `default:"2s" usage:"Timeout for establishing the TCP connection to a backend. Bounds how long a dial to a scaled-to-zero server's Service (no endpoints) waits before the auto-scale asleep MOTD / scale-up fallback is served; operators with fast on-cluster backends can lower it so that fallback fires sooner"`
 	InKubeCluster          bool              `usage:"Use in-cluster Kubernetes config"`
 	KubeConfig             string            `usage:"The path to a Kubernetes configuration file"`

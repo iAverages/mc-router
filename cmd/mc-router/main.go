@@ -54,7 +54,11 @@ func main() {
 		logrus.SetLevel(cliConfig.LogLevel)
 	}
 
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
+	shutdownSignals := []os.Signal{os.Interrupt}
+	if cliConfig.ServerConfig.DrainOnShutdown {
+		shutdownSignals = append(shutdownSignals, syscall.SIGTERM)
+	}
+	ctx, stop := signal.NotifyContext(context.Background(), shutdownSignals...)
 	defer stop()
 
 	signals := make(chan os.Signal, 1)
@@ -85,6 +89,7 @@ signalsLoop:
 		}
 	}
 
+	stop()
 	logrus.Info("Stopping")
 	wg.Wait()
 }
